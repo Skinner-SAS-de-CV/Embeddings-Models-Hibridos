@@ -1,0 +1,7 @@
+csvs/
+pdf_candidatos/
+virtual/
+*env
+__pycache__/
+
+

@@ -5,20 +5,17 @@ import uvicorn
 import PyPDF2
 import docx2txt
 import re
-from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks, HTTPException, Request
+import dill
+import joblib
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from sqlalchemy.orm import Session
-import smtplib
-from email.message import EmailMessage
-from pydantic import BaseModel, EmailStr, field_validator
-import bleach
+from funciones import extraer_habilidades_responsabilidades 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-import json
 
 load_dotenv(override=True)
 
@@ -38,19 +35,37 @@ app.add_middleware(
 )
 
 # ----------------------------
-# Carga de Modelos
+# Carga del Sistema Guardado
 # ----------------------------
+try:
+    with open('modelos_skinner/sistema_evaluacion_cv.joblib', 'rb') as f:
+        sistema = dill.load(f)
+    print("Sistema de evaluación cargado correctamente")
+    
+    if 'funcion_habilidades' not in sistema:
+        from funciones import extraer_habilidades_responsabilidades
+        sistema['funcion_habilidades'] = extraer_habilidades_responsabilidades
 
-model_mini = SentenceTransformer('modelos_skinner/all_mini_model')
-model_spanish = SentenceTransformer('modelos_skinner/spanish_model')
-clasificador = pipeline(
-    "zero-shot-classification",
-    model="modelos_skinner/zero_shot_classifier",
-    device="cpu"
-)
+    model_mini = sistema['model_mini']
+    model_spanish = sistema['model_spanish']
+    clasificador = sistema['clasificador']
+    evaluar_candidato = sistema['funcion_evaluar']  # Función de evaluación calibrada
+    df_puestos = sistema['df_puestos']
+    config = sistema['configuracion']
+    
+    print(f"Sistema guardado el: {config['fecha_guardado']}")
+    print(f"Pesos configurados: {config['pesos']}")
+    print(f"Habilidades cargadas para {len(df_puestos)} puestos")
+    
+except FileNotFoundError:
+    print("Error: No se encontró el archivo del modelo")
+    raise
+except Exception as e:
+    print(f"Error cargando el sistema: {str(e)}")
+    raise RuntimeError("No se pudo cargar el sistema de evaluación") from e
 
 # ----------------------------
-# Funciones Clave Mejoradas
+# Funciones Clave
 # ----------------------------
 
 def extract_text(file: UploadFile) -> str:
@@ -63,85 +78,87 @@ def extract_text(file: UploadFile) -> str:
         text = docx2txt.process(file.file)
     return text
 
-def match_resume_to_job(resume_text: str, job_desc: str, habilidades: list) -> dict:
-    """Nueva función de matching con modelos mejorados"""
-    # Embeddings con ambos modelos
-    emb_mini_cv = model_mini.encode(resume_text)
-    emb_mini_job = model_mini.encode(job_desc)
-    sim_mini = util.cos_sim(emb_mini_job, emb_mini_cv).item()
-    
-    emb_spanish_cv = model_spanish.encode(resume_text)
-    emb_spanish_job = model_spanish.encode(job_desc)
-    sim_spanish = util.cos_sim(emb_spanish_job, emb_spanish_cv).item()
-    
-    # Detección de habilidades
-    if habilidades:
-        resultados_hab = clasificador(
-            resume_text,
-            candidate_labels=habilidades,
-            multi_label=True
+async def match_resume_to_job(resume_text: str, job_desc: str, habilidades: list) -> dict:
+    """Usa el sistema guardado para evaluar el CV"""
+    try:
+        # Usamos la función de evaluación del sistema guardado
+        resultado = evaluar_candidato(
+            cv_text=resume_text,
+            descripcion_puesto=job_desc,
+            habilidades_clave=habilidades
         )
-        puntaje_habilidades = sum(
-            score * 2.5
-            for score in resultados_hab['scores']
-            if score > 0.7
-        )
+        
+        # Convertimos las habilidades detectadas a un formato serializable
         habilidades_detectadas = [
-            (label, round(score, 2))
-            for label, score in zip(resultados_hab['labels'], resultados_hab['scores'])
-            if score > 0.7
+            {"habilidad": h[0], "puntuacion": float(h[1])} 
+            for h in resultado["detalles"]["habilidades_detectadas"]
         ]
-    else:
-        puntaje_habilidades = 0
-        habilidades_detectadas = []
-    puntuacion = (sim_mini * 4 + sim_spanish * 4 + puntaje_habilidades * 2) * 1.25
-    
-    return {
-        "puntuacion": round(puntuacion, 1),
-        "detalles": {
-            "all_mini_score": round(sim_mini * 10, 1),
-            "spanish_model_score": round(sim_spanish * 10, 1),
-            "habilidades_detectadas": habilidades_detectadas
+        
+        return {
+            "puntuacion_cruda": resultado["puntuacion_cruda"],
+            "puntuacion_calibrada": resultado["puntuacion_calibrada"],
+            "categoria": resultado["categoria"],
+            "detalles": {
+                "mini_score": resultado["detalles"]["mini_score"],
+                "spanish_score": resultado["detalles"]["spanish_score"],
+                "habilidades_score": resultado["detalles"]["habilidades_score"],
+                "habilidades_detectadas": habilidades_detectadas
+            }
         }
-    }
+        
+    except Exception as e:
+        print(f"Error en evaluación: {str(e)}")
+        # Agrega más detalles al error para diagnóstico
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error en evaluación: {str(e)}"
+        ) from e
 
 async def generate_gpt_feedback(texto_cv: str, tipo_de_trabajo: str, descripcion_del_trabajo: str) -> str:
     prompt = f"""
     Eres un experto en recursos humanos. Analiza el siguiente CV para el puesto: {tipo_de_trabajo}
-    - Analisa el **{texto_cv}** si cumple con las habilidades del puesto de trabajo.
-    -Analisa si el candidato cumple con la **{descripcion_del_trabajo}**.
     
-    Descripción del puesto:
-    {descripcion_del_trabajo}
-    
-    CV del candidato:
-    {texto_cv[:5000]}... [truncado]
-    
-    **Tareas a realizar:**
-    - Resume los puntos fuertes y débiles del candidato.
-    - Explica si tiene las habilidades requeridas o no.
-    - Analiza si cumple con las funciones y requisitos del cliente.
-    - Da una recomendación final sobre si el candidato es adecuado para el puesto segun con la calificación.
+    **CONTENIDO DEL CV:**
+    {texto_cv[:10000]}  # Limita a 10,000 caracteres por seguridad
 
-    ** Formato de respuesta esperado:**
-    - **Puntos Fuertes:** 
-    - **Puntos Débiles:** 
-    - **Cumplimiento con el perfil:** 
-    - **Recomendación final:**
+    **DESCRIPCIÓN DEL PUESTO:**
+    {descripcion_del_trabajo}
+
+    **TAREAS:**
+    - Resume puntos fuertes/debiles basado EXCLUSIVAMENTE en el CV
+    - Compara las habilidades del CV con: {descripcion_del_trabajo}
+    - Analiza cumplimiento de funciones/requisitos con : {descripcion_del_trabajo}
+    - Recomendación final basada en datos concretos
+    
+    **FORMATO:**
+    - Puntos Fuertes: [Menciona habilidades específicas del CV]
+    - Puntos Débiles: [Falta de habilidades requeridas]
+    - Cumplimiento: [% de coincidencia con el puesto]
+    - Recomendación: [Fundamentada en el análisis]
+    
+    IMPORTANTE: 
+    - Solo menciona habilidades/experiencia EXPLÍCITAS en el CV. 
+    - Nunca asumas o inferas información no escrita.
     """
     
-    response = await async_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Eres un experto en selección de talento humano."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    
-    return response.choices[0].message.content
+    try:
+        response = await async_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Eres un experto en selección de talento humano."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3  # temperatura controla la creatividad
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error en GPT: {str(e)}")
+        return "Error generando feedback"
 
 # ----------------------------
-# Endpoint Principal Mejorado
+# Endpoint Principal
 # ----------------------------
 
 @app.post("/analyze/")
@@ -152,64 +169,33 @@ async def analyze_resume(
     habilidades: str = Form(...),
     nombre_candidato: str = Form(...)
 ):
-    texto_cv = extract_text(file)
+    # Extraer texto del CV
+    cv_text = extract_text(file)
     
     # Convertir habilidades a lista
     habilidades_lista = [h.strip() for h in habilidades.split(",")] if habilidades else []
     
-    match_task = asyncio.to_thread(
-        match_resume_to_job, 
-        texto_cv, 
-        descripcion_del_trabajo,
-        habilidades_lista
-    )
-    feedback_task = generate_gpt_feedback(texto_cv, tipo_de_trabajo, descripcion_del_trabajo)
+    # Evaluar coincidencia y generar feedback en paralelo
+    match_task = asyncio.create_task(
+        match_resume_to_job(cv_text, descripcion_del_trabajo, habilidades_lista))
+    feedback_task = asyncio.create_task(
+        generate_gpt_feedback(cv_text, tipo_de_trabajo, descripcion_del_trabajo))
     
     match_result, feedback = await asyncio.gather(match_task, feedback_task)
     
-    # Determinar decisión
-    if match_result["puntuacion"] >= 8.0:
-        calificacion = "Alto"
-    elif match_result["puntuacion"] >= 6.0:
-        calificacion = "Moderado"
-    else:
-        calificacion = "Bajo"
-    
+    # Respuesta estructurada usando la categoría ya calculada
     return {
         "candidate": nombre_candidato,
         "job": tipo_de_trabajo,
-        "calificacion": match_result["puntuacion"],
-        "decision": calificacion,
+        "puntuacion_cruda": match_result["puntuacion_cruda"],
+        "puntuacion_calibrada": match_result["puntuacion_calibrada"],
+        "decision": match_result["categoria"],  # Usamos la categoría ya calculada
         "feedback": feedback,
-        "details": match_result["detalles"]
-    }
-
-# ----------------------------
-# Endpoint de Prueba Rápida no es necesario tenerlo pero para pruebas rápidas esta super útil.
-# ----------------------------
-
-@app.post("/quick_test/")
-async def quick_test(
-    file: UploadFile = File(...),
-    tipo_de_trabajo: str = Form(...),
-    descripcion_del_trabajo: str = Form(...),
-    habilidades: str = Form("")
-):
-    """Endpoint simplificado para pruebas rápidas"""
-    habilidades_lista = [h.strip() for h in habilidades.split(",")] if habilidades else []
-    resume_text = extract_text(file)
-    
-    match_result = await asyncio.to_thread(
-        match_resume_to_job,  
-        resume_text,
-        descripcion_del_trabajo,
-        habilidades_lista
-    )
-    
-    return {
-        "job": tipo_de_trabajo,
-        "match_score": match_result["puntuacion"],
-        "details": match_result["detalles"]
+        "details": match_result["detalles"],
+        "config": {
+            "pesos": config['pesos'],
+            "umbral_habilidades": config['umbral_habilidades']
+        }
     }
 
 if __name__ == "__main__":
